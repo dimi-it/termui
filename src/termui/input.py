@@ -6,10 +6,14 @@ All prompts use the active theme and share a single ``PromptSession``.
 from __future__ import annotations
 
 import os
+import re
+import string
 import subprocess
 import tempfile
+from dataclasses import dataclass
+from datetime import date, datetime
 from pathlib import Path
-from typing import Any, Callable, List, Optional, TypeVar
+from typing import Any, Callable, Optional, TypeVar
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.completion import (
@@ -19,6 +23,7 @@ from prompt_toolkit.completion import (
     WordCompleter,
 )
 from prompt_toolkit.formatted_text import FormattedText
+from prompt_toolkit.history import InMemoryHistory
 from prompt_toolkit.validation import ValidationError, Validator
 
 from . import theme as _theme
@@ -26,15 +31,29 @@ from .output import print_error, print_table
 
 T = TypeVar("T")
 
+# ── Document-like dataclass (replaces duck-typed hack) ───────────────
+
+@dataclass(frozen=True)
+class _Document:
+    """Minimal stand-in for ``prompt_toolkit.document.Document``.
+
+    Used to feed raw strings into :class:`Validator` instances without
+    resorting to dynamic ``type()`` hacks.
+    """
+
+    text: str
+
+
 # ── Shared PromptSession ─────────────────────────────────────────────
 
-_session: PromptSession | None = None
+_session: PromptSession[str] | None = None
+_history: InMemoryHistory = InMemoryHistory()
 
 
-def _get_session() -> PromptSession:
+def _get_session() -> PromptSession[str]:
     global _session
     if _session is None:
-        _session = PromptSession(style=_theme.pt_style())
+        _session = PromptSession(style=_theme.pt_style(), history=_history)
     return _session
 
 
@@ -51,11 +70,13 @@ def _prompt(label: str, **kwargs: Any) -> str:
 # ── Validators ───────────────────────────────────────────────────────
 
 class _RangeValidator(Validator):
-    def __init__(self, lo: float | None, hi: float | None, cast: type) -> None:
-        self._lo, self._hi, self._cast = lo, hi, cast
+    def __init__(self, lo: float | None, hi: float | None, cast: type[int] | type[float]) -> None:
+        self._lo = lo
+        self._hi = hi
+        self._cast = cast
 
     def validate(self, document: Any) -> None:
-        text = document.text.strip()
+        text: str = document.text.strip()
         try:
             v = self._cast(text)
         except ValueError:
@@ -68,7 +89,6 @@ class _RangeValidator(Validator):
 
 class _RegexValidator(Validator):
     def __init__(self, pattern: str, message: str) -> None:
-        import re
         self._re = re.compile(pattern)
         self._message = message
 
@@ -84,9 +104,10 @@ def ask_input(
     *,
     default: str = "",
     placeholder: str = "",
-    validator: Optional[Callable[[str], bool]] = None,
+    validator: Callable[[str], bool] | None = None,
     error_message: str = "Invalid input.",
     allow_empty: bool = False,
+    history: bool = True,
 ) -> str:
     """General-purpose text prompt.
 
@@ -98,9 +119,17 @@ def ask_input(
     validator:     Optional callable; return ``True`` if valid.
     error_message: Shown when *validator* returns ``False``.
     allow_empty:   If ``False``, an empty answer is rejected.
+    history:       Use ``prompt_toolkit`` in-memory history (↑ recalls).
+
+    Examples
+    --------
+    >>> name = ask_input("Your name")
     """
+    kwargs: dict[str, Any] = {"default": default}
+    if not history:
+        kwargs["history"] = InMemoryHistory()
     while True:
-        result = _prompt(prompt_text, default=default)
+        result = _prompt(prompt_text, **kwargs)
         if not result and not allow_empty:
             print_error("Input cannot be empty.")
             continue
@@ -115,6 +144,7 @@ def ask_secret(
     *,
     confirm: bool = False,
     confirm_prompt: str = "Confirm",
+    show_strength: bool = False,
 ) -> str:
     """Password / secret prompt that masks input.
 
@@ -123,12 +153,21 @@ def ask_secret(
     prompt_text:    Label for the first prompt.
     confirm:        If ``True``, ask the user to re-enter for verification.
     confirm_prompt: Label for the confirmation prompt.
+    show_strength:  Display a live password strength indicator.
+
+    Examples
+    --------
+    >>> pw = ask_secret("Password", confirm=True, show_strength=True)
     """
     while True:
         value = _get_session().prompt(
             FormattedText([("class:prompt", f"{prompt_text} ❯ ")]),
             is_password=True,
         ).strip()
+        if show_strength:
+            strength = _password_strength(value)
+            from .output import print_info
+            print_info(f"Strength: {strength}")
         if not confirm:
             return value
         confirm_value = _get_session().prompt(
@@ -140,14 +179,40 @@ def ask_secret(
         print_error("Values do not match. Try again.")
 
 
+def _password_strength(password: str) -> str:
+    """Return a human-readable strength label for *password*.
+
+    Returns
+    -------
+    str
+        One of ``"very weak"``, ``"weak"``, ``"fair"``, ``"strong"``,
+        ``"very strong"``.
+    """
+    score = 0
+    if len(password) >= 8:
+        score += 1
+    if len(password) >= 12:
+        score += 1
+    if any(c in string.ascii_lowercase for c in password):
+        score += 1
+    if any(c in string.ascii_uppercase for c in password):
+        score += 1
+    if any(c in string.digits for c in password):
+        score += 1
+    if any(c in string.punctuation for c in password):
+        score += 1
+    levels = ["very weak", "weak", "weak", "fair", "strong", "very strong", "very strong"]
+    return levels[min(score, len(levels) - 1)]
+
+
 # ── Numeric input ────────────────────────────────────────────────────
 
 def ask_int(
     prompt_text: str,
     *,
-    default: Optional[int] = None,
-    min_value: Optional[int] = None,
-    max_value: Optional[int] = None,
+    default: int | None = None,
+    min_value: int | None = None,
+    max_value: int | None = None,
 ) -> int:
     """Integer prompt with optional range validation.
 
@@ -158,7 +223,7 @@ def ask_int(
     min_value:   Inclusive lower bound.
     max_value:   Inclusive upper bound.
     """
-    validator = _RangeValidator(min_value, max_value, int)
+    v = _RangeValidator(min_value, max_value, int)
     label = prompt_text
     if min_value is not None or max_value is not None:
         bounds = f"{min_value or '−∞'} – {max_value or '+∞'}"
@@ -166,7 +231,7 @@ def ask_int(
     while True:
         raw = _prompt(label, default=str(default) if default is not None else "")
         try:
-            validator.validate(type("D", (), {"text": raw})())
+            v.validate(_Document(text=raw))
             return int(raw)
         except ValidationError as exc:
             print_error(str(exc.message))
@@ -175,17 +240,17 @@ def ask_int(
 def ask_float(
     prompt_text: str,
     *,
-    default: Optional[float] = None,
-    min_value: Optional[float] = None,
-    max_value: Optional[float] = None,
+    default: float | None = None,
+    min_value: float | None = None,
+    max_value: float | None = None,
 ) -> float:
     """Float prompt with optional range validation."""
-    validator = _RangeValidator(min_value, max_value, float)
+    v = _RangeValidator(min_value, max_value, float)
     label = prompt_text
     while True:
         raw = _prompt(label, default=str(default) if default is not None else "")
         try:
-            validator.validate(type("D", (), {"text": raw})())
+            v.validate(_Document(text=raw))
             return float(raw)
         except ValidationError as exc:
             print_error(str(exc.message))
@@ -218,7 +283,7 @@ def ask_confirm(prompt_text: str, *, default: bool = True) -> bool:
 def ask_file(
     prompt_text: str,
     *,
-    extensions: Optional[List[str]] = None,
+    extensions: list[str] | None = None,
     must_exist: bool = True,
 ) -> str:
     """File-path prompt with filesystem tab-completion.
@@ -279,9 +344,9 @@ def ask_directory(
 
 def ask_select(
     prompt_text: str,
-    options: List[str],
+    options: list[str],
     *,
-    default: Optional[int] = None,
+    default: int | None = None,
 ) -> str:
     """Numbered single-choice selection.
 
@@ -313,11 +378,11 @@ def ask_select(
 
 def ask_multiselect(
     prompt_text: str,
-    options: List[str],
+    options: list[str],
     *,
     min_choices: int = 1,
-    max_choices: Optional[int] = None,
-) -> List[str]:
+    max_choices: int | None = None,
+) -> list[str]:
     """Numbered multi-choice selection.
 
     The user enters comma-separated indices, e.g. ``1,3,4``.
@@ -358,11 +423,259 @@ def ask_multiselect(
         return [options[i - 1] for i in indices]
 
 
+# ── Interactive arrow-key selection ──────────────────────────────────
+
+def ask_select_interactive(
+    prompt_text: str,
+    options: list[str],
+    *,
+    default: int = 0,
+    search: bool = True,
+) -> str:
+    """Interactive arrow-key single-choice menu.
+
+    Uses ``prompt_toolkit``'s ``radiolist_dialog`` when available, falling
+    back to :func:`ask_select` if the dialog cannot be created.
+
+    Parameters
+    ----------
+    prompt_text : str
+        Question displayed above the list.
+    options : list[str]
+        Choices.
+    default : int
+        0-based index of the default selection.
+    search : bool
+        Enable type-to-filter (header hint).
+
+    Returns
+    -------
+    str
+        The selected option string.
+
+    Examples
+    --------
+    >>> choice = ask_select_interactive("Pick a model", ["gpt-4", "claude"])
+    """
+    try:
+        from prompt_toolkit.shortcuts import radiolist_dialog
+        result = radiolist_dialog(
+            title=prompt_text,
+            values=[(opt, opt) for opt in options],
+            default=options[default] if default < len(options) else options[0],
+        ).run()
+        if result is None:
+            return options[default]
+        return str(result)
+    except Exception:
+        return ask_select(prompt_text, options, default=default + 1)
+
+
+def ask_multiselect_interactive(
+    prompt_text: str,
+    options: list[str],
+    *,
+    min_choices: int = 1,
+    max_choices: int | None = None,
+    preselected: list[int] | None = None,
+) -> list[str]:
+    """Interactive arrow-key multi-choice menu with checkboxes.
+
+    Uses ``prompt_toolkit``'s ``checkboxlist_dialog`` when available.
+
+    Parameters
+    ----------
+    prompt_text : str
+        Question displayed above the list.
+    options : list[str]
+        Choices.
+    min_choices : int
+        Minimum required selections.
+    max_choices : int | None
+        Maximum allowed selections.
+    preselected : list[int] | None
+        0-based indices of pre-checked options.
+
+    Returns
+    -------
+    list[str]
+        The selected option strings.
+
+    Examples
+    --------
+    >>> picks = ask_multiselect_interactive("Features", ["streaming", "tools"])
+    """
+    try:
+        from prompt_toolkit.shortcuts import checkboxlist_dialog
+        defaults = [options[i] for i in (preselected or [])]
+        while True:
+            result = checkboxlist_dialog(
+                title=prompt_text,
+                values=[(opt, opt) for opt in options],
+                default_values=defaults,
+            ).run()
+            selected: list[str] = [str(r) for r in (result or [])]
+            if len(selected) < min_choices:
+                print_error(f"Select at least {min_choices} option(s).")
+                continue
+            if max_choices and len(selected) > max_choices:
+                print_error(f"Select at most {max_choices} option(s).")
+                continue
+            return selected
+    except Exception:
+        return ask_multiselect(
+            prompt_text, options,
+            min_choices=min_choices, max_choices=max_choices,
+        )
+
+
+# ── Date / datetime ──────────────────────────────────────────────────
+
+def ask_date(
+    prompt_text: str,
+    *,
+    default: date | None = None,
+    fmt: str = "%Y-%m-%d",
+) -> date:
+    """Prompt the user for a date.
+
+    Parameters
+    ----------
+    prompt_text : str
+        Label shown before the cursor.
+    default : date | None
+        Pre-filled default.
+    fmt : str
+        Expected date format string.
+
+    Returns
+    -------
+    date
+
+    Examples
+    --------
+    >>> d = ask_date("Start date")
+    """
+    default_str = default.strftime(fmt) if default else ""
+    while True:
+        raw = _prompt(f"{prompt_text} ({fmt})", default=default_str)
+        try:
+            return datetime.strptime(raw, fmt).date()
+        except ValueError:
+            print_error(f"Invalid date.  Expected format: {fmt}")
+
+
+def ask_datetime(
+    prompt_text: str,
+    *,
+    default: datetime | None = None,
+    fmt: str = "%Y-%m-%d %H:%M",
+) -> datetime:
+    """Prompt the user for a datetime.
+
+    Parameters
+    ----------
+    prompt_text : str
+        Label shown before the cursor.
+    default : datetime | None
+        Pre-filled default.
+    fmt : str
+        Expected datetime format string.
+
+    Returns
+    -------
+    datetime
+
+    Examples
+    --------
+    >>> dt = ask_datetime("Deadline")
+    """
+    default_str = default.strftime(fmt) if default else ""
+    while True:
+        raw = _prompt(f"{prompt_text} ({fmt})", default=default_str)
+        try:
+            return datetime.strptime(raw, fmt)
+        except ValueError:
+            print_error(f"Invalid datetime.  Expected format: {fmt}")
+
+
+# ── URL / email ──────────────────────────────────────────────────────
+
+_URL_RE = re.compile(
+    r"https?://"
+    r"(?:[a-zA-Z0-9\-._~:/?#\[\]@!$&'()*+,;=%])+"
+)
+
+_EMAIL_RE = re.compile(
+    r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}"
+)
+
+
+def ask_url(
+    prompt_text: str,
+    *,
+    default: str = "",
+) -> str:
+    """Prompt for a URL with built-in validation.
+
+    Parameters
+    ----------
+    prompt_text : str
+        Label shown before the cursor.
+    default : str
+        Pre-filled default.
+
+    Returns
+    -------
+    str
+        Validated URL string.
+
+    Examples
+    --------
+    >>> url = ask_url("API endpoint")
+    """
+    while True:
+        raw = _prompt(prompt_text, default=default)
+        if _URL_RE.fullmatch(raw):
+            return raw
+        print_error("Enter a valid URL (must start with http:// or https://).")
+
+
+def ask_email(
+    prompt_text: str,
+    *,
+    default: str = "",
+) -> str:
+    """Prompt for an email address with built-in validation.
+
+    Parameters
+    ----------
+    prompt_text : str
+        Label shown before the cursor.
+    default : str
+        Pre-filled default.
+
+    Returns
+    -------
+    str
+        Validated email string.
+
+    Examples
+    --------
+    >>> email = ask_email("Contact email")
+    """
+    while True:
+        raw = _prompt(prompt_text, default=default)
+        if _EMAIL_RE.fullmatch(raw):
+            return raw
+        print_error("Enter a valid email address (e.g. user@example.com).")
+
+
 # ── Autocomplete ─────────────────────────────────────────────────────
 
 def ask_autocomplete(
     prompt_text: str,
-    completions: List[str],
+    completions: list[str],
     *,
     fuzzy: bool = True,
     allow_free_text: bool = False,
@@ -396,7 +709,7 @@ def ask_editor(
     *,
     initial_text: str = "",
     extension: str = ".txt",
-    editor: Optional[str] = None,
+    editor: str | None = None,
 ) -> str:
     """Open ``$EDITOR`` (or *editor*) and return the saved content.
 
@@ -407,7 +720,7 @@ def ask_editor(
     extension:    Temp-file extension (helps editors pick syntax highlighting).
     editor:       Override the editor command; falls back to ``$EDITOR`` → ``nano``.
     """
-    from ui.output import print_info
+    from .output import print_info
     print_info(prompt_text)
 
     editor_cmd = editor or os.environ.get("EDITOR", "nano")
@@ -427,7 +740,7 @@ def ask_editor(
 
 # ── Form (multiple fields in one call) ───────────────────────────────
 
-def ask_form(fields: List[dict[str, Any]]) -> dict[str, Any]:
+def ask_form(fields: list[dict[str, Any]]) -> dict[str, Any]:
     """Collect multiple values with a single call.
 
     Each element of *fields* is a ``dict`` with at minimum ``"name"`` and
@@ -439,6 +752,18 @@ def ask_form(fields: List[dict[str, Any]]) -> dict[str, Any]:
     ``"text"`` (default), ``"secret"``, ``"int"``, ``"float"``,
     ``"confirm"``, ``"select"``, ``"multiselect"``, ``"file"``,
     ``"directory"``, ``"autocomplete"``, ``"editor"``.
+
+    Validation hooks
+    ----------------
+    Each field dict may include a ``"validate"`` key — a
+    ``Callable[[Any], str | None]`` that returns an error message or ``None``.
+    The field is re-prompted until validation passes.
+
+    Conditional fields
+    ------------------
+    A ``"depends_on"`` key with ``{"field": "name", "value": expected}``
+    causes the field to be skipped unless a previously collected value
+    matches.
 
     Example::
 
@@ -470,15 +795,32 @@ def ask_form(fields: List[dict[str, Any]]) -> dict[str, Any]:
     }
 
     result: dict[str, Any] = {}
-    for field in fields:
-        field = dict(field)  # shallow copy
-        name = field.pop("name")
-        prompt_text = field.pop("prompt")
-        field_type = field.pop("type", "text")
+    for field_def in fields:
+        field_def = dict(field_def)  # shallow copy
+        name: str = field_def.pop("name")
+        prompt_text: str = field_def.pop("prompt")
+        field_type: str = field_def.pop("type", "text")
+        validate_fn: Callable[[Any], str | None] | None = field_def.pop("validate", None)
+        depends_on: dict[str, Any] | None = field_def.pop("depends_on", None)
+
+        # Conditional field — skip if dependency not met
+        if depends_on is not None:
+            dep_field = depends_on.get("field", "")
+            dep_value = depends_on.get("value")
+            if result.get(dep_field) != dep_value:
+                continue
 
         fn = _DISPATCH.get(field_type)
         if fn is None:
             raise ValueError(f"Unknown field type: {field_type!r}")
 
-        result[name] = fn(prompt_text, **field)
+        while True:
+            value = fn(prompt_text, **field_def)
+            if validate_fn is not None:
+                error = validate_fn(value)
+                if error is not None:
+                    print_error(error)
+                    continue
+            break
+        result[name] = value
     return result
